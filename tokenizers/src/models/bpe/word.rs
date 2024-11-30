@@ -8,6 +8,7 @@ struct Merge {
     pos: usize,
     rank: u32,
     new_id: u32,
+    multiword: bool,
 }
 
 impl PartialEq for Merge {
@@ -75,7 +76,9 @@ impl std::fmt::Debug for Word {
 
 impl Word {
     pub(super) fn new() -> Self {
-        Word { symbols: vec![] }
+        Word { 
+            symbols: vec![],
+        }
     }
 
     pub(super) fn with_capacity(capacity: usize) -> Self {
@@ -109,8 +112,8 @@ impl Word {
         c2: u32,
         replacement: u32,
         max_length: usize,
-    ) -> Vec<(Pair, i32)> {
-        let mut changes: Vec<(Pair, i32)> = vec![];
+    ) -> Vec<(Pair, i64)> {
+        let mut changes: Vec<(Pair, i64)> = vec![];
         let mut i = 0;
         loop {
             if i >= self.symbols.len() {
@@ -158,10 +161,14 @@ impl Word {
         changes
     }
 
-    pub(super) fn merge_all(&mut self, merges: &HashMap<Pair, (u32, u32)>, dropout: Option<f32>) {
-        let mut queue = BinaryHeap::with_capacity(self.symbols.len());
-        let mut skip = Vec::with_capacity(queue.len());
+    pub(super) fn merge_all(&mut self, merges: &HashMap<Pair, (u32, u32)>, dropout: Option<f32>, vocab_r: &HashMap<u32, String>) {
+        // This is the function where we actually execute the merges for the given word.
+        // println!("Inside merge_all() in tokenizers/src/models/bpe/word.rs");
+        // merges is a HashMap of ((left_id, right_id), (merge_rank, new_id))
 
+        let mut queue = BinaryHeap::with_capacity(self.symbols.len());
+        let mut skip = Vec::with_capacity(queue.len());  // used for BPE dropout
+        
         queue.extend(
             self.symbols
                 .windows(2)
@@ -172,18 +179,31 @@ impl Word {
                         pos: index,
                         rank: m.0,
                         new_id: m.1,
+                        multiword: vocab_r.get(&pair.1).map_or(false, |id| id.to_string().starts_with("Ġ"))
                     })
                 }),
         );
 
+        // println!("Initial elements of queue:");
+        // for elem in queue.iter() {
+        //     println!("{} ({})", merges_as_text[elem.rank as usize], elem.rank);
+        // }
+
         while let Some(top) = queue.pop() {
+            // println!("Popping merge: {} ({})", merges_as_text[top.rank as usize], top.rank);
+            // println!("Multiword: {:?}", top.multiword);
+
             if dropout
                 .map(|d| thread_rng().gen::<f32>() < d)
-                .unwrap_or(false)
+                .unwrap_or(false) && top.multiword
             {
+                // println!("Dropping merge: {} ({})", merges_as_text[top.rank as usize], top.rank);
                 skip.push(top);
             } else {
                 // Re-insert the skipped elements
+                // for elem in skip.iter() {
+                //     println!("Re-insert skipped merge: {} ({})", merges_as_text[elem.rank as usize], elem.rank);
+                // }
                 queue.extend(skip.drain(..));
 
                 if self.symbols[top.pos].len == 0 {
@@ -205,6 +225,10 @@ impl Word {
                 {
                     continue;
                 }
+                
+                // at this point the merge is used, so we can push
+                // println!("--- Apply merge: {} ({}) ---", merges_as_text[top.rank as usize], top.rank);
+                // self.merges.push(top.rank as i64);
 
                 // Otherwise, let's merge
                 self.symbols[top.pos].merge_with(&right, top.new_id);
@@ -227,7 +251,9 @@ impl Word {
                             pos: current.prev as usize,
                             rank: *rank,
                             new_id: *new_id,
+                            multiword: vocab_r.get(&current.c).map_or(false, |id| id.to_string().starts_with("Ġ"))
                         });
+                        // println!("Add merge to queue: {} ({})", merges_as_text[*rank as usize], *rank);
                     }
                 }
 
@@ -241,7 +267,9 @@ impl Word {
                             pos: top.pos,
                             rank: *rank,
                             new_id: *new_id,
+                            multiword: vocab_r.get(&next_symbol.c).map_or(false, |id| id.to_string().starts_with("Ġ"))
                         });
+                        // println!("Add merge to queue: {} ({})", merges_as_text[*rank as usize], *rank);
                     }
                 }
             }
@@ -310,10 +338,10 @@ mod tests {
         assert_eq!(
             changes,
             &[
-                ((1u32, 2u32), -1i32), // count for ('e', 'l') should be decreased by 1.
-                ((1u32, 4u32), 1i32),  // count for ('e', 'll') should be increased by 1.
-                ((2u32, 3u32), -1i32), // count for ('l', 'o') should be decreased by 1.
-                ((4u32, 3u32), 1i32),  // count for ('ll', 'o') should be increased by 1.
+                ((1u32, 2u32), -1i64), // count for ('e', 'l') should be decreased by 1.
+                ((1u32, 4u32), 1i64),  // count for ('e', 'll') should be increased by 1.
+                ((2u32, 3u32), -1i64), // count for ('l', 'o') should be decreased by 1.
+                ((4u32, 3u32), 1i64),  // count for ('ll', 'o') should be increased by 1.
             ]
         );
     }
@@ -345,10 +373,10 @@ mod tests {
         assert_eq!(
             changes,
             &[
-                ((1u32, 2u32), -1i32), // count for ('e', 'l') should be decreased by 1.
-                // ((1u32, 4u32), 1i32),  Missing since this would be larger than 2
-                ((2u32, 3u32), -1i32), // count for ('l', 'o') should be decreased by 1.
-                                       // ((4u32, 3u32), 1i32), Missing since this would be larger than 2
+                ((1u32, 2u32), -1i64), // count for ('e', 'l') should be decreased by 1.
+                // ((1u32, 4u32), 1i64),  Missing since this would be larger than 2
+                ((2u32, 3u32), -1i64), // count for ('l', 'o') should be decreased by 1.
+                                       // ((4u32, 3u32), 1i64), Missing since this would be larger than 2
             ]
         );
     }

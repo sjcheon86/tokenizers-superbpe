@@ -7,6 +7,7 @@ use crate::utils::progress::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::io::Read;
 
 #[derive(Debug, Eq)]
 struct Merge {
@@ -375,7 +376,7 @@ impl BpeTrainer {
         words: &[Word],
         counts: &[u64],
         p: &Option<ProgressBar>,
-    ) -> (HashMap<Pair, i32>, HashMap<Pair, HashSet<usize>>) {
+    ) -> (HashMap<Pair, i64>, HashMap<Pair, HashSet<usize>>) {
         words
             .maybe_par_iter()
             .enumerate()
@@ -403,7 +404,7 @@ impl BpeTrainer {
                             h.insert(i);
                             h
                         });
-                    *pair_counts.get_mut(&cur_pair).unwrap() += count as i32;
+                    *pair_counts.get_mut(&cur_pair).unwrap() += count as i64;
                 }
 
                 if let Some(p) = &p {
@@ -430,6 +431,392 @@ impl BpeTrainer {
     }
 
     pub fn do_train(
+        &self,
+        word_counts: &HashMap<String, u64>,  // these are counts of whitespace-delimited words
+        model: &mut BPE,
+    ) -> Result<Vec<AddedToken>> {
+        let file = std::fs::File::open("merges.txt");
+        
+        if file.is_ok() {  // If merges.txt exists, extend it
+            println!("Calling do_train_extend()");
+            return self.do_train_extend(word_counts, model);
+        } else {  // Else, train from scratch
+            println!("Calling do_train_original()");
+            return self.do_train_original(word_counts, model);
+        }
+    }
+
+    pub fn do_train_extend(
+        &self,
+        word_counts: &HashMap<String, u64>,  // these are counts of whitespace-delimited words
+        model: &mut BPE,
+    ) -> Result<Vec<AddedToken>> {
+        // These are mappings between tokens and indices
+        let mut word_to_id: HashMap<String, u32> = HashMap::with_capacity(self.vocab_size);
+        let mut id_to_word: Vec<String> = Vec::with_capacity(self.vocab_size);
+        let max_token_length: usize = self.max_token_length.unwrap_or(usize::MAX);
+
+        // Read file merges.txt
+        let mut file = std::fs::File::open("merges.txt").unwrap();
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+        let mut lines = contents.lines();
+        let mut merge_order: Vec<(String, String)> = Vec::new();
+        
+        // Remove the first line, which contains the version number
+        lines.next();
+
+        // Loop over the remaining lines
+        for line in lines {
+            // Line is left and right half separated by a space
+            let mut split = line.split(" ");
+            // Add the merge to merge_order
+            merge_order.push((split.next().unwrap().to_string(), split.next().unwrap().to_string()));
+        }
+        
+        // print merge_order
+        // println!("Printing merge_order");
+        // for (left, right) in &merge_order {
+        //     println!("{} + {}", left, right);
+        // }
+
+        let progress = self.setup_progress();
+
+        //
+        // 1. Add all special tokens to the vocabulary (internally modifies word_to_id and id_to_word)
+        //
+        println!("Step 1: Add special tokens");
+        self.add_special_tokens(&mut word_to_id, &mut id_to_word);
+
+        //
+        // 2. Compute the initial alphabet (internally modifies word_to_id and id_to_word)
+        //
+        println!("Step 2: Compute alphabet");
+        self.compute_alphabet(word_counts, &mut word_to_id, &mut id_to_word);
+        
+        // Print the length of word_to_id
+        println!("Length of word_to_id: {}", word_to_id.len());
+
+        // Print 5 elements in word_to_id
+        println!("Printing 5 elements in word_to_id");
+        let mut count = 0;
+        for (word, id) in &word_to_id {
+            println!("Word: {}, ID: {}", word, id);
+            count += 1;
+            if count == 10 {
+                break;
+            }
+        }
+
+        //
+        // 3. Tokenize words: turn real words into tokens based on the initial alphabet
+        //
+        println!("Step 3: Tokenize words");
+        self.update_progress(&progress, word_counts.len(), "Tokenize words");
+        let (words, counts) =
+            self.tokenize_words(word_counts, &mut word_to_id, &mut id_to_word, &progress);
+        self.finalize_progress(&progress, words.len());
+        
+        // print word_counts
+        // println!("Printing word_counts");
+        // for (word, count) in word_counts {
+        //     println!("Word: {}, Count: {}", word, count);
+        // }
+
+        //
+        // 4. Count pairs in words
+        //
+        println!("Step 4: Count pairs in words");
+        self.update_progress(&progress, words.len(), "Count pairs");
+        let (mut pair_counts, mut where_to_update) = self.count_pairs(&words, &counts, &progress);
+        // Insert them in the queue
+        let mut queue: HashMap<Pair, Merge> = HashMap::new();
+        where_to_update.drain().for_each(|(pair, pos)| {
+            let count = pair_counts[&pair];
+            if count > 0 {
+                let merge = Merge {
+                    pair,
+                    count: count as u64,
+                    pos
+                };
+                // add the merge to the queue
+                queue.insert(pair, merge);
+            }
+        });
+        self.finalize_progress(&progress, words.len());
+        println!("Length of queue: {}", queue.len());
+
+        // println!("Printing queue");
+        // for (pair, merge) in &queue {
+        //     println!("Pair: ({}, {}), Count: {}, Pos: {:?}", id_to_word[pair.0 as usize], id_to_word[pair.1 as usize], merge.count, merge.pos);
+        // }
+
+        //
+        // 5. Inherit all the existing merges in merge_order
+        //
+        println!("Step 5: Apply merges");
+        self.update_progress(&progress, merge_order.len(), "Compute existing merges");
+        let mut merges: Vec<(Pair, u32)> = vec![];
+
+        for (left, right) in &merge_order {
+            // print the merge we are applying
+            // println!("-------");
+            // println!("Applying merge: {} + {}", left, right);
+            
+            // If tokens from merge are not found in the given data
+            if !word_to_id.contains_key(left) || !word_to_id.contains_key(right) {
+                if !word_to_id.contains_key(left) {
+                    println!("{} not found in word_to_id", left);
+                }
+                if !word_to_id.contains_key(right) {
+                    println!("{} not found in word_to_id", right);
+                }
+                continue;
+            }
+
+            // Convert left and right into a Pair using word_to_id
+            let left_id = word_to_id.get(left).unwrap();
+            let right_id = word_to_id.get(right).unwrap();
+            let override_pair = (*left_id, *right_id);
+
+            if !queue.contains_key(&override_pair) {
+                println!("{} + {} not found in queue", left, right);
+                continue;
+            }
+            
+            let mut top: Merge = queue.remove(&override_pair).unwrap();
+            top.count = pair_counts[&top.pair] as u64;
+
+            let part_a = &id_to_word[top.pair.0 as usize];
+            let mut part_b = id_to_word[top.pair.1 as usize].to_owned();
+
+            // Build new token
+            if let Some(prefix) = &self.continuing_subword_prefix {
+                if part_b.starts_with(prefix) {
+                    let prefix_byte_len = prefix.chars().map(|c| c.len_utf8()).sum();
+                    part_b = part_b[prefix_byte_len..].to_string();
+                }
+            }
+            let new_token = format!("{}{}", part_a, part_b);
+            // implement sentencepiece-like merge.
+            // if this code were to be merged, integrate a way in the python bindings to communicate this variable
+            // default should be 0/None to maintain previous behavior. 16 is the spm default.
+
+            // Insert new token if it does not already exist
+            let new_token_id = word_to_id
+                .get(&new_token)
+                .copied()
+                .unwrap_or(id_to_word.len() as u32);
+            if word_to_id.get(&new_token).is_none() {
+                id_to_word.push(new_token.clone());
+                word_to_id.insert(new_token.clone(), new_token_id);
+            }
+            merges.push((top.pair, new_token_id));
+
+            // Merge the new pair in every word
+            let changes = top
+                .pos
+                .maybe_par_iter()
+                .flat_map(|&i| {
+                    let word = &words[i] as *const _ as *mut Word;
+                    // We can merge each of these words in parallel here because each position
+                    // can be there only once (HashSet). So this is safe.
+                    unsafe {
+                        // let word: &mut Word = &mut (*word);
+                        (*word)
+                            .merge(top.pair.0, top.pair.1, new_token_id, max_token_length)
+                            .into_iter()
+                            .map(|c| (c, i))
+                            .collect::<Vec<_>>()
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            // Introduce new formed pairs
+            for ((pair, change), iw) in changes {
+                let count = change * counts[iw] as i64;
+                pair_counts
+                    .entry(pair)
+                    .and_modify(|c| *c += count)
+                    .or_insert(count);
+                if change > 0 {
+                    where_to_update
+                        .entry(pair)
+                        .and_modify(|h| {
+                            h.insert(iw);
+                        })
+                        .or_insert_with(|| {
+                            let mut h = HashSet::new();
+                            h.insert(iw);
+                            h
+                        });
+                }
+            }
+            where_to_update.drain().for_each(|(pair, pos)| {
+                let count = pair_counts[&pair];
+                if count > 0 {
+                    queue.insert(pair, Merge {
+                        pair,
+                        count: count as u64,
+                        pos,
+                    });
+                }
+            });
+
+            if let Some(p) = &progress {
+                p.inc(1);
+            }
+        }
+        self.finalize_progress(&progress, merges.len());
+
+        // print length of merges
+        println!("Length of merges: {}", merges.len());
+
+        //
+        // 6. Add new merges
+        //
+        println!("Step 5: Do new merges");
+        self.update_progress(&progress, self.vocab_size, "Compute new merges");
+        // currently queue is HashMap<Pair, Merge>
+        // we want to transform it to BinaryHeap while keeping the same entries
+        let mut queue: BinaryHeap<Merge> = queue.into_iter().map(|(_, v)| v).collect();
+
+        loop {
+            // Stop as soon as we have a big enough vocabulary
+            if word_to_id.len() >= self.vocab_size {
+                break;
+            }
+
+            if queue.is_empty() {
+                break;
+            }
+
+            let mut top: Merge = queue.pop().unwrap();
+            
+            if top.count != pair_counts[&top.pair] as u64 {
+                // println!("{} != {} for pair: ({}, {})", top.count, pair_counts[&top.pair], id_to_word[top.pair.0 as usize], id_to_word[top.pair.1 as usize]);
+                top.count = pair_counts[&top.pair] as u64;
+                queue.push(top);
+                continue;
+            }
+
+            if top.count < 1 || self.min_frequency > top.count {
+                break;
+            }
+            
+            // println!("Merging pair: ({}, {}) with count {}", id_to_word[top.pair.0 as usize], id_to_word[top.pair.1 as usize], top.count);
+
+            let part_a = &id_to_word[top.pair.0 as usize];
+            let mut part_b = id_to_word[top.pair.1 as usize].to_owned();
+
+            // Build new token
+            if let Some(prefix) = &self.continuing_subword_prefix {
+                if part_b.starts_with(prefix) {
+                    let prefix_byte_len = prefix.chars().map(|c| c.len_utf8()).sum();
+                    part_b = part_b[prefix_byte_len..].to_string();
+                }
+            }
+            let new_token = format!("{}{}", part_a, part_b);
+            // println!("New token: {}", new_token);
+            // implement sentencepiece-like merge.
+            // if this code were to be merged, integrate a way in the python bindings to communicate this variable
+            // default should be 0/None to maintain previous behavior. 16 is the spm default.
+
+            // Insert new token if it does not already exist
+            let new_token_id = word_to_id
+                .get(&new_token)
+                .copied()
+                .unwrap_or(id_to_word.len() as u32);
+            if word_to_id.get(&new_token).is_none() {
+                id_to_word.push(new_token.clone());
+                word_to_id.insert(new_token.clone(), new_token_id);
+            }
+            merges.push((top.pair, new_token_id));
+
+            // Merge the new pair in every word
+            let changes = top
+                .pos
+                .maybe_par_iter()
+                .flat_map(|&i| {
+                    let word = &words[i] as *const _ as *mut Word;
+                    // We can merge each of these words in parallel here because each position
+                    // can be there only once (HashSet). So this is safe.
+                    unsafe {
+                        // let word: &mut Word = &mut (*word);
+                        (*word)
+                            .merge(top.pair.0, top.pair.1, new_token_id, max_token_length)
+                            .into_iter()
+                            .map(|c| (c, i))
+                            .collect::<Vec<_>>()
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            // Introduce new formed pairs
+            for ((pair, change), iw) in changes {
+                let count = change * counts[iw] as i64;
+                pair_counts
+                    .entry(pair)
+                    .and_modify(|c| *c += count)
+                    .or_insert(count);
+                if change > 0 {
+                    where_to_update
+                        .entry(pair)
+                        .and_modify(|h| {
+                            h.insert(iw);
+                        })
+                        .or_insert_with(|| {
+                            let mut h = HashSet::new();
+                            h.insert(iw);
+                            h
+                        });
+                }
+            }
+            where_to_update.drain().for_each(|(pair, pos)| {
+                let count = pair_counts[&pair];
+                if count > 0 {
+                    queue.push(Merge {
+                        pair,
+                        count: count as u64,
+                        pos,
+                    });
+                }
+            });
+
+            if let Some(p) = &progress {
+                p.inc(1);
+            }
+        }
+        self.finalize_progress(&progress, merges.len());
+
+        // Transfer new vocab & options to model
+        model.vocab = word_to_id;
+        model.vocab_r = model
+            .vocab
+            .iter()
+            .map(|(key, val)| (*val, key.to_owned()))
+            .collect();
+        model.merges = merges
+            .into_iter()
+            .enumerate()
+            .map(|(i, (pair, new_token_id))| (pair, (i as u32, new_token_id)))
+            .collect();
+
+        if let Some(prefix) = &self.continuing_subword_prefix {
+            model.continuing_subword_prefix = Some(prefix.to_owned());
+        } else {
+            model.continuing_subword_prefix = None;
+        }
+        if let Some(suffix) = &self.end_of_word_suffix {
+            model.end_of_word_suffix = Some(suffix.to_owned());
+        } else {
+            model.end_of_word_suffix = None;
+        }
+
+        Ok(self.special_tokens.clone())
+    }
+
+    pub fn do_train_original(
         &self,
         word_counts: &HashMap<String, u64>,
         model: &mut BPE,
@@ -550,7 +937,7 @@ impl BpeTrainer {
 
             // Introduce new formed pairs
             for ((pair, change), iw) in changes {
-                let count = change * counts[iw] as i32;
+                let count = change * counts[iw] as i64;
                 pair_counts
                     .entry(pair)
                     .and_modify(|c| *c += count)
