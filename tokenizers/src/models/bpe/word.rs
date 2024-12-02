@@ -166,6 +166,10 @@ impl Word {
         // println!("Inside merge_all() in tokenizers/src/models/bpe/word.rs");
         // merges is a HashMap of ((left_id, right_id), (merge_rank, new_id))
 
+        // let merges_as_text = std::fs::read_to_string("tokenizer_json/pile_10G_50K_extend_200K/merges.txt").unwrap();
+        // let mut merges_as_text: Vec<&str> = merges_as_text.split("\n").collect();
+        // merges_as_text.remove(0);
+
         let mut queue = BinaryHeap::with_capacity(self.symbols.len());
         let mut skip = Vec::with_capacity(queue.len());  // used for BPE dropout
         
@@ -186,25 +190,24 @@ impl Word {
 
         // println!("Initial elements of queue:");
         // for elem in queue.iter() {
-        //     println!("{} ({})", merges_as_text[elem.rank as usize], elem.rank);
+        //     println!("{} (pos: {}, rank: {})", merges_as_text[elem.rank as usize], elem.pos, elem.rank);
         // }
 
         while let Some(top) = queue.pop() {
-            // println!("Popping merge: {} ({})", merges_as_text[top.rank as usize], top.rank);
-            // println!("Multiword: {:?}", top.multiword);
+            // println!("--- Popping merge: {} (pos: {}, rank: {}, multiword: {:?}) ---", merges_as_text[top.rank as usize], top.pos, top.rank, top.multiword);
 
             if dropout
                 .map(|d| thread_rng().gen::<f32>() < d)
                 .unwrap_or(false) && top.multiword
             {
-                // println!("Dropping merge: {} ({})", merges_as_text[top.rank as usize], top.rank);
+                // println!("Dropping merge");
                 skip.push(top);
             } else {
                 // Re-insert the skipped elements
                 // for elem in skip.iter() {
-                //     println!("Re-insert skipped merge: {} ({})", merges_as_text[elem.rank as usize], elem.rank);
+                //     println!("Re-insert skipped merge: {}", merges_as_text[elem.rank as usize]);
                 // }
-                queue.extend(skip.drain(..));
+                // queue.extend(skip.drain(..));
 
                 if self.symbols[top.pos].len == 0 {
                     continue;
@@ -227,8 +230,7 @@ impl Word {
                 }
                 
                 // at this point the merge is used, so we can push
-                // println!("--- Apply merge: {} ({}) ---", merges_as_text[top.rank as usize], top.rank);
-                // self.merges.push(top.rank as i64);
+                // println!("Apply merge");
 
                 // Otherwise, let's merge
                 self.symbols[top.pos].merge_with(&right, top.new_id);
@@ -253,7 +255,7 @@ impl Word {
                             new_id: *new_id,
                             multiword: vocab_r.get(&current.c).map_or(false, |id| id.to_string().starts_with("Ġ"))
                         });
-                        // println!("Add merge to queue: {} ({})", merges_as_text[*rank as usize], *rank);
+                        // println!("Add merge to queue: {} (pos: {}, rank: {})", merges_as_text[*rank as usize], current.prev as usize, *rank);
                     }
                 }
 
@@ -269,7 +271,7 @@ impl Word {
                             new_id: *new_id,
                             multiword: vocab_r.get(&next_symbol.c).map_or(false, |id| id.to_string().starts_with("Ġ"))
                         });
-                        // println!("Add merge to queue: {} ({})", merges_as_text[*rank as usize], *rank);
+                        // println!("Add merge to queue: {} (pos: {}, rank: {})", merges_as_text[*rank as usize], current.prev as usize, *rank);
                     }
                 }
             }
