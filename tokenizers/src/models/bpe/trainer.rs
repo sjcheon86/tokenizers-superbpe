@@ -4,6 +4,7 @@ use super::{Pair, WithFirstLastIterator, Word, BPE};
 use crate::parallelism::*;
 use crate::tokenizer::{AddedToken, Result, Trainer};
 use crate::utils::progress::{ProgressBar, ProgressStyle};
+use regex_syntax::ast::print;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -451,6 +452,8 @@ impl BpeTrainer {
         word_counts: &HashMap<String, u64>,  // these are counts of whitespace-delimited words
         model: &mut BPE,
     ) -> Result<Vec<AddedToken>> {
+        println!("In do_train_extend()");
+
         // These are mappings between tokens and indices
         let mut word_to_id: HashMap<String, u32> = HashMap::with_capacity(self.vocab_size);
         let mut id_to_word: Vec<String> = Vec::with_capacity(self.vocab_size);
@@ -717,6 +720,20 @@ impl BpeTrainer {
                 }
             }
             let new_token = format!("{}{}", part_a, part_b);
+
+            // special case : by not allowing any tokens that contain :Ġ
+            if new_token.contains(":Ġ") {
+                println!("Skipping merge {} {} because of : special-casing", part_a, part_b);
+                continue;
+            }
+            
+            // skip any multi-word tokens consisting of n or more Ġ which are not consecutive
+            let num_words = new_token.split("Ġ").filter(|s| !s.is_empty()).count();
+            if num_words > 4 {
+                println!("Skipping merge {} {} because it has {} words", part_a, part_b, num_words);
+                continue;
+            }
+
             // println!("New token: {}", new_token);
             // implement sentencepiece-like merge.
             // if this code were to be merged, integrate a way in the python bindings to communicate this variable
@@ -893,6 +910,10 @@ impl BpeTrainer {
             let part_a = &id_to_word[top.pair.0 as usize];
             let mut part_b = id_to_word[top.pair.1 as usize].to_owned();
 
+            // if (part_a.contains("Ġ") || part_b.contains("Ġ")) && !part_a.starts_with("Ġ") {
+            //     continue;
+            // }
+            
             // Build new token
             if let Some(prefix) = &self.continuing_subword_prefix {
                 if part_b.starts_with(prefix) {
