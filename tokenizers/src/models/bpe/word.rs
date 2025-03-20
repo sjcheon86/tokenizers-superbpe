@@ -166,7 +166,7 @@ impl Word {
         // println!("Inside merge_all() in tokenizers/src/models/bpe/word.rs");
         // merges is a HashMap of ((left_id, right_id), (merge_rank, new_id))
 
-        // let merges_as_text = std::fs::read_to_string("tokenizer_json/pile_10G_50K_extend_200K/merges.txt").unwrap();
+        // let merges_as_text = std::fs::read_to_string("tokenizer_json/olmo2_p99_truncate_10G_80K_extend_200K_mw4/merges.txt").unwrap();
         // let mut merges_as_text: Vec<&str> = merges_as_text.split("\n").collect();
         // merges_as_text.remove(0);
 
@@ -230,7 +230,7 @@ impl Word {
                 }
                 
                 // at this point the merge is used, so we can push
-                // println!("Apply merge");
+                // println!("Apply merge {}", merges_as_text[top.rank as usize]);
 
                 // Otherwise, let's merge
                 self.symbols[top.pos].merge_with(&right, top.new_id);
